@@ -1,0 +1,322 @@
+<?php
+
+declare(strict_types=1);
+
+namespace SugarCraft\Metrics;
+
+/**
+ * Application-facing facade. Hand a {@see Backend} in, then call
+ * {@see counter()} / {@see gauge()} / {@see histogram()} from
+ * application code; the registry forwards each call to the
+ * backend.
+ *
+ * The split is intentional — backend swap is a config concern,
+ * call sites stay backend-agnostic. This is the standard
+ * Prometheus-client / StatsD-client shape.
+ *
+ * The registry also offers a {@see time()} helper that returns a
+ * closure to call when the timed operation finishes, recording
+ * the elapsed seconds as a histogram.
+ *
+ * `withTags()` returns a new registry whose every emit is
+ * pre-tagged — useful for SSH session middleware that wants to
+ * stamp every metric with `user`/`client_addr` without threading
+ * those tags through every call site.
+ *
+ * When a metric accumulates too many unique label-value
+ * combinations (cardinality explosion), the oldest combination
+ * is evicted to stay within the configured limit — and the evicted
+ * series is also removed from the backend, so the bounded cache
+ * keeps the (otherwise unbounded) backend from growing without
+ * limit under a tag flood.
+ */
+
+use SugarCraft\Metrics\Instrument\AsyncCounter;
+use SugarCraft\Metrics\Instrument\AsyncGauge;
+use SugarCraft\Metrics\Instrument\UpDownCounter;
+
+final class Registry
+{
+    /** @var array<string,string> */
+    private readonly array $defaultTags;
+
+    /**
+     * Precomputed cardinality key for {@see $defaultTags}, so the common
+     * `$tags === []` emit path skips re-sorting/joining the default tags
+     * on every call.
+     */
+    private readonly string $defaultTagsKey;
+
+    /** @var array<string, Descriptor> */
+    private array $descriptors = [];
+
+    /**
+     * Per-metric cardinality cache: metric name → (tag-key → merged tags).
+     * The value holds the merged tag set so an evicted series can be removed
+     * from the backend by rebuilding its storage key.
+     *
+     * @var array<string, array<string, array<string,string>>>
+     */
+    private array $labelValueCache = [];
+
+    /**
+     * Maximum unique label-value combinations allowed per metric.
+     * When exceeded, {@see deleteLabelValues()} evicts the oldest entry.
+     */
+    private int $cardinalityLimit;
+
+    /**
+     * @param array<string,string> $defaultTags
+     */
+    public function __construct(
+        private readonly Backend $backend,
+        array $defaultTags = [],
+        int $cardinalityLimit = 10000,
+    ) {
+        $this->defaultTags = $defaultTags;
+        $this->defaultTagsKey = Util::tagKey($defaultTags);
+        $this->cardinalityLimit = $cardinalityLimit;
+    }
+
+    /**
+     * Register a metric descriptor for early TYPE/HELP emission.
+     * Idempotent: a second registration with the same name is a no-op.
+     */
+    public function register(Descriptor $descriptor): void
+    {
+        if (isset($this->descriptors[$descriptor->name])) {
+            return;
+        }
+        $this->descriptors[$descriptor->name] = $descriptor;
+        $this->backend->describe($descriptor);
+    }
+
+    public function counter(string $name, float $value = 1.0, array $tags = []): void
+    {
+        $this->backend->counter($name, $value, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    public function gauge(string $name, float $value, array $tags = []): void
+    {
+        $this->backend->gauge($name, $value, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    public function histogram(string $name, float $value, array $tags = []): void
+    {
+        $this->backend->histogram($name, $value, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    /**
+     * Add a positive or negative increment to a synchronous up-down counter.
+     *
+     * @param array<string,string> $tags
+     */
+    public function upDownCounter(string $name, float $amount, array $tags = []): void
+    {
+        $this->backend->upDownCounter($name, $amount, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    /**
+     * Record an observation from an asynchronous counter callback.
+     *
+     * @param array<string,string> $tags
+     */
+    public function asyncCounter(string $name, float $value, array $tags = []): void
+    {
+        $this->backend->asyncCounter($name, $value, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    /**
+     * Record an observation from an asynchronous gauge callback.
+     *
+     * @param array<string,string> $tags
+     */
+    public function asyncGauge(string $name, float $value, array $tags = []): void
+    {
+        $this->backend->asyncGauge($name, $value, $this->mergeTags($tags));
+        $this->trackCardinality($name, $tags);
+    }
+
+    /**
+     * Factory: create a new UpDownCounter instrument for repeated add() calls.
+     *
+     * @param array<string,string> $tags Static tags applied on every add() call.
+     */
+    public function newUpDownCounter(string $name, string $help = '', array $tags = []): Instrument\UpDownCounter
+    {
+        return new Instrument\UpDownCounter($this, $name, $help);
+    }
+
+    /**
+     * Factory: create a new AsyncCounter instrument whose value is observed at collection time.
+     *
+     * @param \Closure(): float $callback Called at observe() time to obtain the current value.
+     * @param array<string,string> $tags Static tags attached to observations.
+     */
+    public function newAsyncCounter(string $name, string $help, \Closure $callback, array $tags = []): Instrument\AsyncCounter
+    {
+        return new Instrument\AsyncCounter($this, $name, $help, $callback, $tags);
+    }
+
+    /**
+     * Factory: create a new AsyncGauge instrument whose value is observed at collection time.
+     *
+     * @param \Closure(): float $callback Called at observe() time to obtain the current value.
+     * @param array<string,string> $tags Static tags attached to observations.
+     */
+    public function newAsyncGauge(string $name, string $help, \Closure $callback, array $tags = []): Instrument\AsyncGauge
+    {
+        return new Instrument\AsyncGauge($this, $name, $help, $callback, $tags);
+    }
+
+    /**
+     * Start a wall-clock timer. Returns a closure — when invoked,
+     * it records the elapsed seconds as a histogram under `$name`.
+     *
+     * ```php
+     * $stop = $registry->time('handler.duration');
+     * doExpensiveThing();
+     * $stop();
+     * ```
+     *
+     * Or capture the closure to record once on success:
+     *
+     * ```php
+     * $stop = $registry->time('handler.duration', ['route' => '/x']);
+     * try { ... } finally { $stop(); }
+     * ```
+     *
+     * @param array<string,string> $tags
+     * @return callable(): float
+     */
+    public function time(string $name, array $tags = []): callable
+    {
+        $start = microtime(true);
+        return function () use ($name, $tags, $start): float {
+            $elapsed = microtime(true) - $start;
+            $this->histogram($name, $elapsed, $tags);
+            return $elapsed;
+        };
+    }
+
+    /**
+     * Returns a child registry whose every emit is pre-tagged
+     * with `$tags` (merged on top of the existing defaults).
+     *
+     * @param array<string,string> $tags
+     */
+    public function withTags(array $tags): self
+    {
+        return new self($this->backend, array_merge($this->defaultTags, $tags), $this->cardinalityLimit);
+    }
+
+    public function backend(): Backend
+    {
+        return $this->backend;
+    }
+
+    /**
+     * Number of unique label-value combinations currently tracked
+     * for `$name`.
+     */
+    public function cardinality(string $name): int
+    {
+        return count($this->labelValueCache[$name] ?? []);
+    }
+
+    /**
+     * Evict the oldest recorded label combination for `$name`
+     * when the cardinality limit is exceeded.
+     *
+     * This is called automatically on every emit; backends MAY
+     * also call it directly to reclaim memory for stale label sets.
+     *
+     * @param array<string,string> $tags
+     */
+    public function deleteLabelValues(string $name, array $tags = []): void
+    {
+        $key = $this->tagKey($tags);
+        unset($this->labelValueCache[$name][$key]);
+    }
+
+    /**
+     * Remove a specific metric series from the backend and the
+     * cardinality cache. Useful for long-running processes or
+     * testing cleanup.
+     *
+     * @param array<string,string> $tags
+     */
+    public function remove(string $name, array $tags = []): void
+    {
+        $this->backend->remove($name, $tags);
+        $this->deleteLabelValues($name, $tags);
+    }
+
+    /**
+     * @param array<string,string> $tags
+     * @return array<string,string>
+     */
+    private function mergeTags(array $tags): array
+    {
+        return $tags === [] ? $this->defaultTags : array_merge($this->defaultTags, $tags);
+    }
+
+    /**
+     * Track a label-value combination and evict the oldest when
+     * the per-metric cardinality limit is exceeded.
+     *
+     * Eviction also removes the evicted series from the backend, so a
+     * flood of unique tag combinations can't grow backend memory without
+     * bound — the cache is capped, but the backend is not. The merged tags
+     * are stored as the cache value precisely so the backend key can be
+     * rebuilt at eviction time.
+     *
+     * @param array<string,string> $tags
+     */
+    private function trackCardinality(string $name, array $tags): void
+    {
+        // Fast path for the no-tags emit: reuse the precomputed default key
+        // instead of re-sorting/joining the default tags every call.
+        if ($tags === []) {
+            $merged = $this->defaultTags;
+            $key = $this->defaultTagsKey;
+        } else {
+            $merged = array_merge($this->defaultTags, $tags);
+            $key = $this->tagKey($merged);
+        }
+        if (isset($this->labelValueCache[$name][$key])) {
+            return;
+        }
+        if (isset($this->labelValueCache[$name]) === false) {
+            $this->labelValueCache[$name] = [];
+        }
+        $this->labelValueCache[$name][$key] = $merged;
+        if (count($this->labelValueCache[$name]) > $this->cardinalityLimit) {
+            $oldestMergedTags = reset($this->labelValueCache[$name]);
+            $oldestKey = key($this->labelValueCache[$name]);
+            unset($this->labelValueCache[$name][$oldestKey]);
+            // Evicting from the bounded cache alone leaks the series in the
+            // unbounded backend — reclaim it so a flood of unique tag combos
+            // can't grow backend memory without limit (DoS).
+            $this->backend->remove($name, $oldestMergedTags);
+        }
+    }
+
+    /**
+     * Build a stable tag-only string key for cardinality tracking.
+     * Returns `k1=v1|k2=v2` (no metric name prefix) with tags sorted by key.
+     * Distinct from InMemoryBackend::key() which includes the metric name
+     * and uses a different separator for storage accumulation.
+     *
+     * @param array<string,string> $tags
+     */
+    private function tagKey(array $tags): string
+    {
+        return Util::tagKey($tags);
+    }
+}
